@@ -1,0 +1,16 @@
+@"
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.pyc
+node_modules/
+dist/
+.vite/
+*.log
+*.db
+*.sqlite3
+.DS_Store
+"@ | Out-File -Encoding utf8 .gitignore
