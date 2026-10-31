@@ -318,13 +318,14 @@ Our goal is to make architecture design more transparent, explainable and adapta
 
 ## 👥 Team
 
-**Team Name:** [Add Team Name]
+**Team Name:** NULL X
 
 **Team Members:**
-1. [Member 1]
-2. [Member 2]
-3. [Member 3]
-4. [Member 4]
+1. SELVAGANAPATHY K
+2. MATHAN S
+3. MANOJ K
+4. TAMILKUMARAN K
+5. PRIYADHARSHINI M
 
 ## 🏆 Hackathon
 
