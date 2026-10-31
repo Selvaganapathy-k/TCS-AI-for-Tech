@@ -1,57 +1,74 @@
-from typing import Optional
+"""SQLite persistence for ArchIntel AI. No MongoDB required."""
+import json
+import sqlite3
+from pathlib import Path
+from typing import Any, Optional
 
-from datetime import datetime, timezone
-from pymongo import MongoClient
-from pymongo.collection import Collection
+# backend/app/db.py -> backend/archintel.db
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+DB_PATH = BACKEND_DIR / "archintel.db"
 
-from .config import MONGODB_DATABASE, MONGODB_URI
 
-PROJECTS_COLLECTION = "projects"
+def _connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
 
-_client: Optional[MongoClient] = None
-_projects: Optional[Collection] = None
 
-def init_db():
-    global _client, _projects
-    if not MONGODB_URI:
-        raise RuntimeError("MONGODB_URI must be set in backend/.env before starting the API.")
+def init_db() -> None:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS projects (
+                project_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                state_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
 
-    _client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    _client.admin.command("ping")
-    database = _client[MONGODB_DATABASE]
-    if PROJECTS_COLLECTION not in database.list_collection_names():
-        database.create_collection(PROJECTS_COLLECTION)
-    _projects = database[PROJECTS_COLLECTION]
 
-def _collection() -> Collection:
-    if _projects is None:
-        raise RuntimeError("MongoDB has not been initialized.")
-    return _projects
+def save(project_id: str, name: str, state: dict[str, Any]) -> None:
+    """Insert or update a project; compatible with existing main.py calls."""
+    if not project_id:
+        raise ValueError("project_id cannot be empty")
+    if not isinstance(state, dict):
+        raise TypeError("state must be a dictionary")
 
-def save(pid, name, state):
-    _collection().replace_one(
-        {"_id": pid},
-        {
-            "_id": pid,
-            "name": name,
-            "state": state,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        },
-        upsert=True,
-    )
+    payload = json.dumps(state, ensure_ascii=False, default=str)
+    with _connect() as conn:
+        conn.execute("""
+            INSERT INTO projects (project_id, name, state_json)
+            VALUES (?, ?, ?)
+            ON CONFLICT(project_id) DO UPDATE SET
+                name = excluded.name,
+                state_json = excluded.state_json,
+                updated_at = CURRENT_TIMESTAMP
+        """, (project_id, name, payload))
+        conn.commit()
 
-def get(pid):
-    row = _collection().find_one({"_id": pid}, {"_id": 0, "name": 1, "state": 1})
-    return {"name": row["name"], "state": row["state"]} if row else None
 
-def ping_db():
-    if _client is None:
-        raise RuntimeError("MongoDB has not been initialized.")
-    _client.admin.command("ping")
+def get(project_id: str) -> Optional[dict[str, Any]]:
+    """Return the {'name': ..., 'state': ...} shape expected by main.py."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT name, state_json FROM projects WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
 
-def close_db():
-    global _client, _projects
-    if _client is not None:
-        _client.close()
-    _client = None
-    _projects = None
+    if row is None:
+        return None
+    return {"name": row["name"], "state": json.loads(row["state_json"])}
+
+
+def delete(project_id: str) -> bool:
+    with _connect() as conn:
+        cursor = conn.execute(
+            "DELETE FROM projects WHERE project_id = ?", (project_id,)
+        )
+        conn.commit()
+        return cursor.rowcount > 0

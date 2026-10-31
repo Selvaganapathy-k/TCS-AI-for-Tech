@@ -1,96 +1,183 @@
 import uuid
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
 from .config import MAX_UPLOAD_MB
-from .db import close_db, get, init_db, ping_db, save
+from .db import init_db, save, get
 from .parser import parse_file
 from .agents import analyze, design, resolve, change_requirement
 from .llm import available
 
-app=FastAPI(title="ArchIntel AI API")
+
+app = FastAPI(title="ArchIntel AI API")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173"
-    ],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 
+
 class Approval(BaseModel):
-    approved:bool=True
-    resolutions:dict[str,str]=Field(default_factory=dict)
+    approved: bool = True
+    resolutions: dict[str, str] = Field(default_factory=dict)
+
+
 class Change(BaseModel):
-    change_text:str
-    approved:bool=False
+    change_text: str
+    approved: bool = False
+
 
 @app.on_event("startup")
-def startup(): init_db()
+def startup():
+    init_db()
 
-@app.on_event("shutdown")
-def shutdown(): close_db()
 
 @app.get("/api/health")
 def health():
-    ping_db()
-    return {"status":"ok","database_connected":True,"ollama_connected":available()}
+    return {
+        "status": "ok",
+        "ollama_connected": available(),
+        "database": "sqlite",
+    }
+
 
 @app.post("/api/analyze")
-async def analyze_files(project_name:str=Form(...),files:list[UploadFile]=File(...)):
-    project_name = project_name.strip()
-    if not project_name:
-        raise HTTPException(422,"Project name is required")
-    docs=[]
-    for f in files:
-        data=await f.read()
-        if len(data)>MAX_UPLOAD_MB*1024*1024: raise HTTPException(413,f"{f.filename} exceeds upload limit")
-        try: text=parse_file(f.filename,data)
-        except ValueError as e: raise HTTPException(400,str(e))
-        if not text.strip(): raise HTTPException(400,f"No readable text in {f.filename}")
-        docs.append({"name":f.filename,"text":text})
-    pid=str(uuid.uuid4())[:8]; state=analyze(docs)
-    state.update({"project_name":project_name,"documents":[{"name":d["name"],"characters":len(d["text"])} for d in docs],
-                  "status":"awaiting_approval" if state.get("conflicts") else "ready_for_design","change_history":[],"human_decisions":[]})
-    save(pid,project_name,state)
-    return {"project_id":pid,"status":state["status"],"state":state}
+async def analyze_files(
+    project_name: str = Form("ShopSphere"),
+    files: list[UploadFile] = File(...),
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="Upload at least one file.")
+
+    docs = []
+    for uploaded_file in files:
+        data = await uploaded_file.read()
+        if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
+            raise HTTPException(
+                status_code=413,
+                detail=f"{uploaded_file.filename} exceeds upload limit",
+            )
+
+        try:
+            extracted_text = parse_file(uploaded_file.filename, data)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        if not extracted_text or not extracted_text.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"No readable text in {uploaded_file.filename}",
+            )
+        docs.append({"name": uploaded_file.filename, "text": extracted_text})
+
+    project_id = str(uuid.uuid4())[:8]
+    state = analyze(docs)
+    state.update({
+        "project_name": project_name,
+        "documents": [
+            {"name": doc["name"], "characters": len(doc["text"])}
+            for doc in docs
+        ],
+        "status": "awaiting_approval" if state.get("conflicts") else "ready_for_design",
+        "change_history": state.get("change_history", []),
+        "human_decisions": state.get("human_decisions", []),
+    })
+
+    save(project_id, project_name, state)
+    return {"project_id": project_id, "status": state["status"], "state": state}
+
 
 @app.get("/api/projects/{pid}")
-def project(pid:str):
-    p=get(pid)
-    if not p: raise HTTPException(404,"Project not found")
-    return {"project_id":pid,"name":p["name"],"state":p["state"]}
+def project(pid: str):
+    saved_project = get(pid)
+    if not saved_project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return {
+        "project_id": pid,
+        "name": saved_project["name"],
+        "state": saved_project["state"],
+    }
+
 
 @app.post("/api/projects/{pid}/approve")
-def approve(pid:str,req:Approval):
-    p=get(pid)
-    if not p: raise HTTPException(404,"Project not found")
-    s=p["state"]
-    if not req.approved: s["status"]="rejected_by_human"
+def approve(pid: str, req: Approval):
+    saved_project = get(pid)
+    if not saved_project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    state = saved_project["state"]
+    if not req.approved:
+        state["status"] = "rejected_by_human"
     else:
-        s=resolve(s,req.resolutions)
-        blocked=[c for c in s.get("conflicts",[]) if c["severity"]=="High" and c["status"]=="unresolved"]
-        if blocked: raise HTTPException(409,"Resolve every high-severity conflict first")
-        a,v=design(s); s.update({"architecture":a,"verification":v,"status":"verified" if v["score"]>=70 else "needs_review"})
-        for step in s["plan"]:
-            if step["step"]>=3: step["status"]="completed"
-    save(pid,p["name"],s)
-    return {"project_id":pid,"status":s["status"],"state":s}
+        state = resolve(state, req.resolutions)
+        unresolved_high = [
+            item for item in state.get("conflicts", [])
+            if item.get("severity") == "High" and item.get("status") == "unresolved"
+        ]
+        if unresolved_high:
+            raise HTTPException(
+                status_code=409,
+                detail="Resolve every high-severity conflict first",
+            )
+
+        architecture, verification = design(state)
+        state.update({
+            "architecture": architecture,
+            "verification": verification,
+            "status": "verified" if verification.get("score", 0) >= 70 else "needs_review",
+        })
+        for step in state.get("plan", []):
+            if step.get("step", 0) >= 3:
+                step["status"] = "completed"
+
+    save(pid, saved_project["name"], state)
+    return {"project_id": pid, "status": state["status"], "state": state}
+
 
 @app.post("/api/projects/{pid}/change")
-def change(pid:str,req:Change):
-    p=get(pid)
-    if not p: raise HTTPException(404,"Project not found")
-    s=p["state"]
+def change(pid: str, req: Change):
+    saved_project = get(pid)
+    if not saved_project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not req.change_text.strip():
+        raise HTTPException(status_code=400, detail="Change description is required")
+
+    state = saved_project["state"]
     if not req.approved:
-        s["status"]="awaiting_human_approval"; s["proposed_change"]=req.change_text
+        state["status"] = "awaiting_human_approval"
+        state["proposed_change"] = req.change_text
     else:
-        old=s.get("architecture",{})
-        s["previous_architecture"]=old
-        s=change_requirement(s,req.change_text)
-        a,v=design(s); s.update({"architecture":a,"verification":v,"status":"adapted_and_verified" if v["score"]>=70 else "adapted_needs_review"})
-        s["impact_summary"]={"change":req.change_text,"affected_components":s["change_history"][-1]["affected_components"],"verification_score":v["score"],"old_component_count":len(old.get("components",[])),"new_component_count":len(a["components"])}
-    save(pid,p["name"],s)
-    return {"project_id":pid,"status":s["status"],"state":s}
+        old_architecture = state.get("architecture") or {}
+        old_components = old_architecture.get("components", [])
+        state["previous_architecture"] = old_architecture
+
+        state = change_requirement(state, req.change_text)
+        architecture, verification = design(state)
+        state.update({
+            "architecture": architecture,
+            "verification": verification,
+            "status": (
+                "adapted_and_verified"
+                if verification.get("score", 0) >= 70
+                else "adapted_needs_review"
+            ),
+        })
+
+        history = state.setdefault("change_history", [])
+        latest_change = history[-1] if history else {}
+        new_components = architecture.get("components", [])
+        state["impact_summary"] = {
+            "change": req.change_text,
+            "affected_components": latest_change.get("affected_components", []),
+            "verification_score": verification.get("score", 0),
+            "old_component_count": len(old_components),
+            "new_component_count": len(new_components),
+        }
+
+    save(pid, saved_project["name"], state)
+    return {"project_id": pid, "status": state["status"], "state": state}
